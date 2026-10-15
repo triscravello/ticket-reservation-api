@@ -29,10 +29,9 @@ class TicketReservationIntegrationTest {
     @Autowired MutableClock clock;
     final HttpClient client = HttpClient.newHttpClient();
     @BeforeEach void reset() {
-        jdbc.update("DELETE FROM unsafe_reservations");
+        jdbc.update("DELETE FROM idempotency_records"); // Clear referencing rows first!
         jdbc.update("DELETE FROM reservations");
         jdbc.update("UPDATE seats SET state='AVAILABLE', hold_id=NULL, held_by=NULL, hold_expires_at=NULL, version=0");
-        clock.reset();
     }
     @Test void unsafePathDoubleBooksOneSeat() throws Exception {
         var responses = posts(new Spec("/api/lab/unsafe-reservations", body("buyer-a")),

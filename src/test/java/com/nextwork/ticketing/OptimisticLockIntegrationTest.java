@@ -35,6 +35,7 @@ class OptimisticLockIntegrationTest {
     @Autowired JdbcTemplate jdbc;
     @Autowired OptimisticHoldService service;
     @BeforeEach void reset() {
+        jdbc.update("DELETE FROM idempotency_records"); // Clear referencing rows first!
         jdbc.update("DELETE FROM reservations");
         jdbc.update("UPDATE seats SET state='AVAILABLE', hold_id=NULL, held_by=NULL, hold_expires_at=NULL, version=0");
     }

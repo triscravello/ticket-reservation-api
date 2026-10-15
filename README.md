@@ -1,86 +1,86 @@
-# Distributed Ticket Reservation API: PostgreSQL Correctness Core
+# Distributed Ticket Reservation API: Coordination Without Compromising Correctness
 
-A Java 25 and Spring Boot API that demonstrates why ticket correctness belongs in the authoritative database transaction.
-
-## Invariant
-
-For every seat ID, the `reservations` table contains at most one confirmed owner.
+Two Spring Boot API instances share Redis admission state and a PostgreSQL booking database. Redis may shed load, but PostgreSQL remains the authority for idempotency and seat ownership.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    C[Concurrent buyers] --> API[Spring Boot REST API]
-    API --> U[Unsafe lab service]
-    U --> UT[(unsafe_reservations)]
-    API --> S[Transactional reservation service]
-    S --> L[PESSIMISTIC_WRITE seat query]
-    L --> PG[(PostgreSQL)]
-    PG --> UC[UNIQUE reservations.seat_id]
-    F[Flyway migrations] --> PG
-    T[JUnit 5 and virtual-thread clients] --> API
-    TC[Testcontainers] --> PG
+ C[Concurrent buyers] --> A1[API instance 1]
+ C --> A2[API instance 2]
+ A1 --> G[Redis Lua lease gate]
+ A2 --> G
+ A1 --> I[PostgreSQL idempotency key]
+ A2 --> I
+ I --> L[PESSIMISTIC_WRITE seat transaction]
+ L --> P[(PostgreSQL)]
+ P --> U[UNIQUE reservations.seat_id]
+ K[Dockerized k6] --> A1
+ K --> A2
 ```
 
-## Failure first
+## Correctness boundary
 
-The unsafe endpoint performs an availability read, waits at a two-party barrier, and then inserts without a database lock or uniqueness constraint. The test intentionally proves two committed rows for one seat.
+A Redis lease can expire while a slow request is still running, and fail-open can admit more work than the configured limit. Redis never authorizes a sale. PostgreSQL claims the idempotency key, locks the seat, writes the reservation, and enforces one reservation per seat in one transaction.
 
-## Correctness path
-
-1. Start a short transaction.
-2. Lock the seat row with `PESSIMISTIC_WRITE`.
-3. Reclaim an expired hold if necessary.
-4. Validate the current state.
-5. Create or confirm the hold.
-6. Commit the seat state and reservation together.
-7. Let `UNIQUE (seat_id)` provide a final database backstop.
-
-## API
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/api/events/{eventId}/seats` | List logical seat availability |
-| POST | `/api/events/{eventId}/holds` | Create a 30-second hold |
-| POST | `/api/holds/{holdId}/confirm` | Confirm a live hold |
-| DELETE | `/api/holds/{holdId}` | Release a live hold |
-| GET | `/api/reservations/{reservationId}` | Retrieve a confirmed reservation |
-| POST | `/api/lab/unsafe-reservations` | Reproduce double booking in the lab path |
-
-## Run locally
-
-```bash
-docker compose up -d
-mvn spring-boot:run
-```
-
-Seed event: `20000000-0000-0000-0000-000000000001`
-Seed seat A1: `10000000-0000-0000-0000-000000000001`
-
-## Run the proof
+## Run
 
 ```bash
 mvn test
+mvn package
+docker compose up -d --build
 ```
 
-| Scenario | Expected committed outcome |
-| --- | --- |
-| Unsafe two-buyer race | Two unsafe rows for one seat |
-| Safe two-buyer hold race | One `201`, one `409`, one held owner |
-| Duplicate confirmation | One reservation, one rejected retry |
-| Expiry versus confirmation | Expired owner cannot confirm; next buyer can hold |
+The instances listen on `http://localhost:8081` and `http://localhost:8082`.
 
-## Trade-offs
+## Failure modes
 
-- Pessimistic locking is direct for a highly contended seat, but contenders wait and poor lock ordering can create deadlocks.
-- Optimistic locking avoids waiting when conflicts are rare, but hot ticket drops can create failed work and retries.
-- Lazy expiration keeps the hold decision inside the same seat transaction.
-- The unsafe table exists only to preserve reproducible failure evidence.
-- PostgreSQL requires retrying the complete transaction after serialization failures and deadlocks. Retry policy is deferred.
+- `local`: one semaphore per JVM, so two instances can each admit a request.
+- `redis`: one atomic shared lease set coordinates both instances.
+- `fail-open`: bypass Redis after the 200 ms timeout and preserve booking availability.
+- `fail-closed`: return `503` before opening a booking transaction.
 
-## Project 2 handoff
+## Load comparison
 
-Project 2 adds PostgreSQL-backed idempotency, Redis admission control, two application instances, fail-open versus fail-closed outage behavior, and load testing. Redis reduces pressure but never authorizes a sale.
+Run each case from a fresh database:
+
+```bash
+ADMISSION_MODE=off docker compose up -d --build
+docker compose --profile load run --rm k6
+docker compose down -v
+ADMISSION_MODE=redis ADMISSION_LIMIT=8 ADMISSION_HOLD_DELAY=25ms docker compose up -d --build
+docker compose --profile load run --rm k6
+```
+
+| Metric | Admission off | Redis admission |
+| --- | ---: | ---: |
+| Total HTTP requests | Record from `http_reqs` | Record from `http_reqs` |
+| Requests per second | Record actual rate | Record actual rate |
+| p50 latency | Record `med` | Record `med` |
+| p95 latency | Record `p(95)` | Record `p(95)` |
+| Completed reservations | Record counter and SQL | Record counter and SQL |
+| Admission rejections | Record counter | Record counter |
+| Retried requests | Record counter | Record counter |
+| Idempotency replays | Record counter | Record counter |
+| Idempotency conflicts | Record counter | Record counter |
+| PostgreSQL deadlock or serialization conflicts | Record actual log count | Record actual log count |
+| Duplicate confirmed seats | Must be `0` from SQL | Must be `0` from SQL |
+
+Do not estimate missing values.
+
+## Database assertions
+
+```bash
+docker compose exec -T postgres psql -U tickets -d tickets -c "SELECT COUNT(*) FROM reservations;"
+docker compose exec -T postgres psql -U tickets -d tickets -c "SELECT seat_id, COUNT(*) FROM reservations GROUP BY seat_id HAVING COUNT(*) > 1;"
+docker compose exec -T postgres psql -U tickets -d tickets -c "SELECT idempotency_key, COUNT(*) FROM idempotency_records GROUP BY idempotency_key HAVING COUNT(*) > 1;"
+```
+
+The last two queries must return no rows.
+
+## Outage proof
+
+Start a fresh fail-open stack and run `bash scripts/redis-outage-proof.sh`. The script reports request failures separately and exits nonzero only when a database invariant or Redis recovery check fails.
 
 ## Cleanup
 
